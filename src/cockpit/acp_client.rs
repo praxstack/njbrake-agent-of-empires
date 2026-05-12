@@ -1242,7 +1242,7 @@ async fn run_connection_task<W, R>(
     let event_tx_for_perm = event_tx.clone();
     let event_tx_for_block = event_tx.clone();
     let pending_for_perm = pending_responders.clone();
-    let cmd_rx = Arc::new(Mutex::new(cmd_rx));
+    let mut cmd_rx = cmd_rx;
     let session_label_for_log = session_label.clone();
     let res_read = resources.clone();
     let res_write = resources.clone();
@@ -1652,10 +1652,7 @@ async fn run_connection_task<W, R>(
             }
 
             loop {
-                let cmd = {
-                    let mut rx = cmd_rx.lock().await;
-                    rx.recv().await
-                };
+                let cmd = cmd_rx.recv().await;
                 match cmd {
                     Some(ClientCmd::Prompt(text)) => {
                         // First user prompt after session/load: stop
@@ -1675,33 +1672,157 @@ async fn run_connection_task<W, R>(
                         // one for the orphaned prior turn.
                         prompt_sent_since_attach.store(true, Ordering::Relaxed);
                         info!(target: "cockpit.acp", "sending prompt ({} chars)", text.len());
-                        let _ = connection
+                        // Drive the prompt request concurrently with the
+                        // command channel so out-of-band notifications
+                        // (Cancel, SetMode) can be delivered to the agent
+                        // mid-turn. Per the ACP spec, session/cancel is a
+                        // notification specifically designed to be sent
+                        // while a session/prompt request is in flight; if
+                        // we serialise the loop on the prompt's await, the
+                        // cancel sits idle in the channel and only goes
+                        // out after the turn already finished.
+                        let prompt_fut = connection
                             .send_request(PromptRequest::new(
                                 acp_session_id.clone(),
                                 vec![ContentBlock::Text(TextContent::new(text))],
                             ))
-                            .block_task()
-                            .await?;
+                            .block_task();
+                        tokio::pin!(prompt_fut);
+
+                        let mut shutdown = false;
+                        loop {
+                            tokio::select! {
+                                res = &mut prompt_fut => {
+                                    let _ = res?;
+                                    break;
+                                }
+                                cmd = cmd_rx.recv() => {
+                                    match cmd {
+                                        Some(ClientCmd::Cancel) => {
+                                            info!(
+                                                target: "cockpit.acp",
+                                                "sending session/cancel during in-flight prompt"
+                                            );
+                                            connection.send_notification(
+                                                CancelNotification::new(acp_session_id.clone()),
+                                            )?;
+                                            // Keep awaiting the prompt; the
+                                            // agent should resolve it with
+                                            // StopReason::Cancelled.
+                                        }
+                                        Some(ClientCmd::SetMode(mode_id)) => {
+                                            info!(
+                                                target: "cockpit.acp",
+                                                "sending session/set_mode mode={mode_id} during in-flight prompt"
+                                            );
+                                            // Fire the request and hand the
+                                            // response handling to a detached
+                                            // task. Awaiting it here would
+                                            // freeze this select loop for the
+                                            // duration of the round-trip,
+                                            // defeating the point of polling
+                                            // cmd_rx concurrently — a Cancel
+                                            // arriving while set_mode is in
+                                            // flight would queue. The detached
+                                            // task mirrors the success into the
+                                            // event stream so the UI flips even
+                                            // when the adapter (e.g.
+                                            // claude-agent-acp) treats the
+                                            // response as authoritative and
+                                            // skips the follow-up
+                                            // current_mode_update notification.
+                                            let sent = connection.send_request(
+                                                SetSessionModeRequest::new(
+                                                    acp_session_id.clone(),
+                                                    mode_id.clone(),
+                                                ),
+                                            );
+                                            let tx = event_tx_for_block.clone();
+                                            tokio::spawn(async move {
+                                                match sent.block_task().await {
+                                                    Ok(_) => {
+                                                        let _ = tx
+                                                            .send(Event::CurrentModeChanged {
+                                                                current_mode_id: mode_id,
+                                                            })
+                                                            .await;
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            target: "cockpit.acp",
+                                                            "session/set_mode failed mid-turn: {e}"
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        Some(ClientCmd::Prompt(_)) => {
+                                            // Client-side prompt queueing is
+                                            // tracked separately in #1031.
+                                            warn!(
+                                                target: "cockpit.acp",
+                                                "received Prompt while one is in flight; dropping (queueing tracked in #1031)"
+                                            );
+                                        }
+                                        Some(ClientCmd::Shutdown) | None => {
+                                            info!(
+                                                target: "cockpit.acp",
+                                                "shutdown received during in-flight prompt; aborting turn"
+                                            );
+                                            shutdown = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Always emit a terminal Stopped for this turn before
+                        // leaving the Prompt arm, including the shutdown path.
+                        // Consumers (reducer, persisted status) need a single
+                        // turn-end event per turn or they sit on a stale
+                        // "in flight" state forever.
+                        let reason = if shutdown {
+                            "shutdown"
+                        } else {
+                            "prompt_complete"
+                        };
                         let _ = event_tx_for_block
                             .send(Event::Stopped {
-                                reason: "prompt_complete".into(),
+                                reason: reason.into(),
                             })
                             .await;
+                        if shutdown {
+                            break;
+                        }
                     }
                     Some(ClientCmd::Cancel) => {
-                        info!(target: "cockpit.acp", "sending session/cancel");
+                        info!(target: "cockpit.acp", "sending session/cancel (no prompt in flight)");
                         connection
                             .send_notification(CancelNotification::new(acp_session_id.clone()))?;
                     }
                     Some(ClientCmd::SetMode(mode_id)) => {
                         info!(target: "cockpit.acp", "sending session/set_mode mode={mode_id}");
-                        let _ = connection
-                            .send_request(SetSessionModeRequest::new(
-                                acp_session_id.clone(),
-                                mode_id,
-                            ))
-                            .block_task()
-                            .await?;
+                        // Detached, same shape as the mid-turn path: don't
+                        // freeze the cmd_rx loop on the round-trip.
+                        let sent = connection.send_request(SetSessionModeRequest::new(
+                            acp_session_id.clone(),
+                            mode_id.clone(),
+                        ));
+                        let tx = event_tx_for_block.clone();
+                        tokio::spawn(async move {
+                            match sent.block_task().await {
+                                Ok(_) => {
+                                    let _ = tx
+                                        .send(Event::CurrentModeChanged {
+                                            current_mode_id: mode_id,
+                                        })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    warn!(target: "cockpit.acp", "session/set_mode failed: {e}");
+                                }
+                            }
+                        });
                     }
                     Some(ClientCmd::Shutdown) | None => {
                         info!(target: "cockpit.acp", "shutdown received, exiting connection loop");
