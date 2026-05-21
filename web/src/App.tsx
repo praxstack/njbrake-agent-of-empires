@@ -3,6 +3,7 @@ import { useMatch, useNavigate } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { useSessions } from "./hooks/useSessions";
 import { clearCockpitCache } from "./hooks/useCockpit";
+import { clearDraft, sweepOrphanDrafts } from "./lib/cockpitDrafts";
 import { CockpitPrefsProvider } from "./lib/cockpitPrefs";
 import { safeGetItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
@@ -201,6 +202,23 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setSessionStatus,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
+
+  // One-shot orphan-draft sweep once useSessions has settled its first
+  // fetch (success or null). Catches cockpit:draft:<id> keys left behind
+  // by deletions that happened in another tab or on another device since
+  // the last load (#1358). The local-tab delete path calls clearDraft
+  // directly so it does not need to wait for this. Gating on
+  // `sessionsLoaded` rather than `sessions.length > 0` covers the
+  // legitimate empty-server case: a brand-new user with zero sessions
+  // must still get prior orphan drafts swept. Bounded by localStorage
+  // entry count; cheap.
+  const sweptDraftsRef = useRef(false);
+  useEffect(() => {
+    if (sweptDraftsRef.current) return;
+    if (!sessionsLoaded) return;
+    sweptDraftsRef.current = true;
+    sweepOrphanDrafts(new Set(sessions.map((s) => s.id)));
+  }, [sessionsLoaded, sessions]);
 
   const { groups, toggleRepoCollapsed } = useRepoGroups(
     workspaces,
@@ -412,6 +430,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     // the same id doesn't briefly show the prior transcript on
     // remount before fetchReplay clears it.
     clearCockpitCache(sessionId);
+    // Drop the persisted composer draft for the deleted session so its
+    // localStorage key doesn't linger (#1358). Cross-tab / cross-device
+    // deletes go through the startup sweep instead.
+    clearDraft(sessionId);
 
     toastBus.handler?.info("Session deleted");
   }, [deletingSession, activeSessionId, setSessionStatus, navigate]);
