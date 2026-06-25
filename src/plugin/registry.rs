@@ -7,11 +7,49 @@
 //! contributions go live only once the user has granted the capability set the
 //! installed manifest declares (the grant is pinned to the manifest hash).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aoe_plugin_api::{PluginManifest, TrustLevel};
 
+use super::featured::FeaturedIndex;
+use super::integrity;
 use crate::session::{CapabilityGrant, Config};
+
+/// How an installed plugin was validated, the finer provenance the surfaces
+/// show. `TrustLevel` (builtin vs community) stays the coarse capability-policy
+/// axis; this is the user-facing "is this safe" label.
+///
+/// `Featured` is re-derived live from the embedded index and the on-disk tree
+/// hash, never trusted from the (user-writable) lockfile: that derivation also
+/// gates the reserved-namespace lift, so it must not rest on data an attacker
+/// could edit. A featured plugin cannot ship a release-binary, so its installed
+/// tree equals its source tree and the recompute reproduces the pinned hash; it
+/// is also only run for the handful of ids the index actually names. The
+/// manifest-hash grant check still deactivates a community plugin whose
+/// manifest is tampered after install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationState {
+    /// Compiled into the binary.
+    Builtin,
+    /// External, installed from a featured-verified source (matched the curated
+    /// pin at install).
+    Featured,
+    /// External GitHub install, not in the featured index.
+    Community,
+    /// External local-directory install.
+    Local,
+}
+
+impl ValidationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ValidationState::Builtin => "builtin",
+            ValidationState::Featured => "featured",
+            ValidationState::Community => "community",
+            ValidationState::Local => "local",
+        }
+    }
+}
 
 /// A plugin compiled into the aoe binary.
 pub struct BuiltinPlugin {
@@ -47,6 +85,8 @@ pub struct LoadedPlugin {
     pub enabled: bool,
     /// Builtin (auto-granted) or community (capabilities gated).
     pub trust: TrustLevel,
+    /// Finer provenance for display (builtin / featured / community / local).
+    pub validation: ValidationState,
     /// Install source for an external plugin; `None` for builtins.
     pub source: Option<String>,
     /// On-disk directory for an external plugin; `None` for builtins.
@@ -117,6 +157,7 @@ impl PluginRegistry {
                         manifest,
                         enabled,
                         trust: TrustLevel::Builtin,
+                        validation: ValidationState::Builtin,
                         source: None,
                         dir: None,
                         manifest_hash,
@@ -130,7 +171,11 @@ impl PluginRegistry {
             }
         }
 
-        load_external(config, &mut plugins, &mut load_errors);
+        let featured = FeaturedIndex::load().unwrap_or_else(|e| {
+            load_errors.push(format!("reading featured plugin index: {e:#}"));
+            FeaturedIndex::default()
+        });
+        load_external(config, &featured, &mut plugins, &mut load_errors);
 
         Self {
             plugins,
@@ -159,7 +204,34 @@ impl PluginRegistry {
 
 /// Load external plugins from `<app_dir>/plugins/<id>/aoe-plugin.toml`. Each
 /// problem is collected as a non-fatal load error rather than aborting the set.
-fn load_external(config: &Config, plugins: &mut Vec<LoadedPlugin>, load_errors: &mut Vec<String>) {
+/// The display provenance for an external plugin. `Featured` is verified live:
+/// the id must be in the embedded index and the on-disk tree must hash to the
+/// pin. The source-slug match is enforced at install (where the slug is
+/// canonical); here the content hash is the gate, since it is the strong check
+/// and avoids depending on how a persisted source string was canonicalized.
+fn validation_for(
+    featured: &FeaturedIndex,
+    id: &str,
+    dir: &Path,
+    source: Option<&str>,
+) -> ValidationState {
+    if let Some(entry) = featured.get(id) {
+        if integrity::tree_hash(dir).is_ok_and(|h| h == entry.tree_hash) {
+            return ValidationState::Featured;
+        }
+    }
+    match source {
+        Some(s) if s.starts_with("gh:") => ValidationState::Community,
+        _ => ValidationState::Local,
+    }
+}
+
+fn load_external(
+    config: &Config,
+    featured: &FeaturedIndex,
+    plugins: &mut Vec<LoadedPlugin>,
+    load_errors: &mut Vec<String>,
+) {
     let root = match super::plugins_dir() {
         Ok(root) => root,
         Err(e) => {
@@ -215,7 +287,14 @@ fn load_external(config: &Config, plugins: &mut Vec<LoadedPlugin>, load_errors: 
         };
         let id = manifest.id.as_str().to_string();
 
-        if manifest.id.is_reserved_namespace() {
+        let plugin_config = config.plugins.get(&id);
+        let source = plugin_config.and_then(|p| p.source.clone());
+        let validation = validation_for(featured, &id, &dir, source.as_deref());
+
+        // A reserved namespace is only allowed for a live featured-verified
+        // plugin; this is the load-time twin of the install gate, and it
+        // re-derives featured status rather than trusting the lockfile.
+        if manifest.id.is_reserved_namespace() && validation != ValidationState::Featured {
             load_errors.push(format!(
                 "plugin {id:?} at {} uses a reserved namespace and was skipped",
                 dir.display()
@@ -231,9 +310,7 @@ fn load_external(config: &Config, plugins: &mut Vec<LoadedPlugin>, load_errors: 
         }
 
         let manifest_hash = PluginManifest::hash_bytes(&bytes);
-        let plugin_config = config.plugins.get(&id);
         let enabled = plugin_config.map(|p| p.enabled).unwrap_or(true);
-        let source = plugin_config.and_then(|p| p.source.clone());
         let granted = plugin_config
             .and_then(|p| p.grant.as_ref())
             .map(|g| grant_covers(g, &manifest, &manifest_hash))
@@ -243,6 +320,7 @@ fn load_external(config: &Config, plugins: &mut Vec<LoadedPlugin>, load_errors: 
             manifest,
             enabled,
             trust: TrustLevel::Community,
+            validation,
             source,
             dir: Some(dir),
             manifest_hash,
