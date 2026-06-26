@@ -169,6 +169,94 @@ fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
     Some((alt, mouse, sgr))
 }
 
+/// Translate bare LF to CRLF so `capture-pane` seed rows (LF-separated) each
+/// start at column 0 in the parser instead of staircasing off the previous
+/// row's end column. An existing CR is left alone, so a stream that already
+/// uses CRLF is unchanged. `capture-pane` never emits CR, so in practice this
+/// just inserts one before each LF.
+fn lf_to_crlf(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() + raw.len() / 40 + 8);
+    let mut prev = 0u8;
+    for &b in raw {
+        if b == b'\n' && prev != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(b);
+        prev = b;
+    }
+    out
+}
+
+/// (Re)build `parser` from tmux's authoritative `capture-pane` at `cols`x`rows`,
+/// resetting any prior content. `pipe-pane` carries only the app's incremental
+/// output, never tmux's reflow, so on a resize a grid that merely `set_size`d
+/// itself would keep its pre-resize layout while the app reprints onto it,
+/// duplicating the prompt and stranding the cursor on the wrong row (the app
+/// may never emit anything else, so the divergence is permanent). Rebuilding
+/// from `capture-pane` re-syncs the grid to tmux exactly.
+///
+/// The seed is rendered content (`capture-pane -e`), so it carries no DEC
+/// private-mode SETs; the pane's current modes are queried and replayed as a
+/// prefix first, then the body is CRLF-translated (capture-pane uses bare LF;
+/// the parser needs CR to reset the column or each row staircases).
+fn seed_parser(
+    target: &str,
+    parser: &Mutex<vt100::Parser>,
+    app_cursor: &AtomicBool,
+    cols: u16,
+    rows: u16,
+) {
+    let (alt, mouse, mouse_sgr) = pane_modes(target).unwrap_or((false, false, false));
+    let mut prefix: Vec<u8> = Vec::new();
+    if alt {
+        prefix.extend_from_slice(b"\x1b[?1049h");
+    }
+    if mouse {
+        prefix.extend_from_slice(b"\x1b[?1000h");
+    }
+    if mouse_sgr {
+        prefix.extend_from_slice(b"\x1b[?1006h");
+    }
+    // The alternate screen has no scrollback, so only the normal buffer pulls
+    // history (`-S`); the pane keeps that history across re-arms.
+    let seed_start = format!("-{SCROLLBACK_LINES}");
+    let mut seed_args = vec!["capture-pane", "-t", target, "-p", "-e"];
+    if !alt {
+        seed_args.extend_from_slice(&["-S", &seed_start]);
+    }
+    let Ok(out) = Command::new("tmux").args(&seed_args).output() else {
+        return;
+    };
+    // Trim trailing blank rows: capture-pane pads the body out to the full pane
+    // height, and feeding those empty rows would march the parser's cursor down
+    // to the bottom, stranding it well below the app's actual last line. With
+    // them gone the cursor naturally lands right after the final glyph (the
+    // prompt), matching the app, and the position is in the grid's own
+    // coordinates so it can't drift a row off a separately-queried cursor.
+    let body = trim_trailing_blank_rows(&out.stdout);
+    if let Ok(mut p) = parser.lock() {
+        *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        if !prefix.is_empty() {
+            p.process(&prefix);
+        }
+        p.process(&lf_to_crlf(body));
+        app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
+    }
+}
+
+/// Drop trailing whitespace (blank rows, trailing newlines, trailing spaces)
+/// from a `capture-pane` body, so the seeded cursor ends right after the last
+/// real glyph instead of marching down through the pane's empty rows. The
+/// column it lands on doesn't matter to viewers (only the row is rendered as a
+/// cursor cell); a fullscreen app fills the screen so there is nothing to trim.
+fn trim_trailing_blank_rows(raw: &[u8]) -> &[u8] {
+    let mut end = raw.len();
+    while end > 0 && matches!(raw[end - 1], b' ' | b'\n' | b'\r' | b'\t') {
+        end -= 1;
+    }
+    &raw[..end]
+}
+
 /// `pipe-pane -I` (input injection) landed in tmux 2.8, and a dead-pane write
 /// crash was fixed in 3.4, so we require >= 3.4 before arming a channel. Older
 /// tmux (or a `tmux -V` we can't parse) falls back to the capture path. Cached:
@@ -415,6 +503,13 @@ pub(crate) struct VtChannel {
     /// true, so a live channel is the single-writer; once it clears, input and
     /// capture both fall back to the legacy tmux path instead of black-holing.
     alive: Arc<AtomicBool>,
+    /// Bumped by the reader thread on each grid change (and on death). A watch
+    /// (not a `Notify`) so EVERY viewer of this shared channel wakes on a
+    /// change, not just one; `subscribe` hands each connection its own
+    /// receiver. Server-only. The carried value is unused (it is the version
+    /// bump that matters), so it is `()`.
+    #[cfg(feature = "serve")]
+    changed_tx: Arc<tokio::sync::watch::Sender<()>>,
     /// Owner-only (0700) directory holding `sock_path`; removed on drop.
     sock_dir: PathBuf,
     sock_path: PathBuf,
@@ -461,6 +556,13 @@ impl VtChannel {
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let app_cursor = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
+        // Bumped by the reader thread on every grid change (and on death) so
+        // a web viewer can render on output instead of polling on a cadence.
+        // A watch so all viewers wake, not just one. Server-only; the TUI
+        // repaints from its own draw loop. The initial receiver is dropped;
+        // `subscribe` mints one per connection.
+        #[cfg(feature = "serve")]
+        let changed_tx = Arc::new(tokio::sync::watch::channel(()).0);
 
         // Bind the socket inside an owner-only (0700) directory so other users
         // on a shared host cannot connect to the pane channel and capture
@@ -487,6 +589,8 @@ impl VtChannel {
             let stream = stream.clone();
             let app_cursor = app_cursor.clone();
             let alive = alive.clone();
+            #[cfg(feature = "serve")]
+            let changed_tx = changed_tx.clone();
             std::thread::spawn(move || {
                 let Ok((conn, _)) = listener.accept() else {
                     return;
@@ -515,6 +619,12 @@ impl VtChannel {
                                 app_cursor
                                     .store(p.screen().application_cursor(), Ordering::Relaxed);
                             }
+                            // Wake every viewer waiting on output. The watch
+                            // coalesces (a viewer that wasn't parked sees the
+                            // bumped version on its next wait), so a chunk that
+                            // lands between waits is not lost.
+                            #[cfg(feature = "serve")]
+                            changed_tx.send_modify(|_| {});
                         }
                         Err(ref e)
                             if e.kind() == std::io::ErrorKind::WouldBlock
@@ -526,6 +636,10 @@ impl VtChannel {
                 // forwarder is gone, so the channel is no longer the live
                 // single-writer. Input dispatch and capture both fall back.
                 alive.store(false, Ordering::Relaxed);
+                // Wake parked viewers so they observe the death promptly
+                // instead of waiting out their heartbeat sleep.
+                #[cfg(feature = "serve")]
+                changed_tx.send_modify(|_| {});
             })
         };
 
@@ -570,44 +684,9 @@ impl VtChannel {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        // Reconstruct the app's terminal modes from tmux's flags before seeding.
-        // The seed is rendered content (`capture-pane`), which does NOT carry
-        // the DEC private mode SET escapes, and a running app won't re-emit
-        // them. Without this, a channel armed while an app is already on the
-        // alternate screen (e.g. Claude `/tui fullscreen`) would parse a normal
-        // screen, so `alternate_screen()` reads false and the wheel-forward /
-        // scroll decisions (which key off it) break.
-        let (alt, mouse, mouse_sgr) = pane_modes(&target).unwrap_or((false, false, false));
-        let mut prefix: Vec<u8> = Vec::new();
-        if alt {
-            prefix.extend_from_slice(b"\x1b[?1049h");
-        }
-        if mouse {
-            prefix.extend_from_slice(b"\x1b[?1000h");
-        }
-        if mouse_sgr {
-            prefix.extend_from_slice(b"\x1b[?1006h");
-        }
-
         // Seed the current screen so an already-running agent shows up
-        // immediately instead of starting blank (pipe-pane has no backlog). The
-        // alternate screen has no scrollback, so only the normal buffer pulls
-        // history (`-S`); the pane keeps that history across re-arms, so a
-        // freshly armed channel can scroll right away.
-        let seed_start = format!("-{SCROLLBACK_LINES}");
-        let mut seed_args = vec!["capture-pane", "-t", &target, "-p", "-e"];
-        if !alt {
-            seed_args.extend_from_slice(&["-S", &seed_start]);
-        }
-        if let Ok(out) = Command::new("tmux").args(&seed_args).output() {
-            if let Ok(mut p) = parser.lock() {
-                if !prefix.is_empty() {
-                    p.process(&prefix);
-                }
-                p.process(&out.stdout);
-                app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
-            }
-        }
+        // immediately instead of starting blank (pipe-pane has no backlog).
+        seed_parser(&target, &parser, &app_cursor, cols, rows);
         seeded.store(true, Ordering::Relaxed);
         tracing::info!(%target, cols, rows, "vt channel armed (pipe-pane -IO <-> vt100 grid)");
 
@@ -618,6 +697,8 @@ impl VtChannel {
             stream,
             app_cursor,
             alive,
+            #[cfg(feature = "serve")]
+            changed_tx,
             sock_dir,
             sock_path,
             stop,
@@ -629,7 +710,10 @@ impl VtChannel {
     }
 
     /// Reconcile the parser size with the pane at most once a second (a
-    /// `display-message` fork; rate-limited so it adds no periodic hitch).
+    /// `display-message` fork; rate-limited so it adds no periodic hitch). On a
+    /// change, re-seed from `capture-pane` rather than just `set_size`: tmux
+    /// reflows on resize but pipe-pane carries no reflow redraw, so a bare
+    /// `set_size` would leave the grid diverged from tmux (see `seed_parser`).
     fn reconcile_size(&self) {
         let mut guard = self.last_size_check.lock().unwrap();
         if guard.elapsed() < Duration::from_secs(1) {
@@ -646,10 +730,33 @@ impl VtChannel {
             {
                 self.cols.store(c, Ordering::Relaxed);
                 self.rows.store(r, Ordering::Relaxed);
-                if let Ok(mut p) = self.parser.lock() {
-                    p.screen_mut().set_size(r, c);
-                }
+                seed_parser(&self.target, &self.parser, &self.app_cursor, c, r);
             }
+        }
+    }
+
+    /// Re-sync the in-process grid to the new pane size immediately. The
+    /// size-owner calls this right after `resize-window` so the grid tracks the
+    /// new geometry without waiting for the periodic `reconcile_size`. It
+    /// re-seeds from `capture-pane` (tmux's authoritative reflowed state) rather
+    /// than locally `set_size`-ing: tmux reflows on resize but pipe-pane carries
+    /// no reflow redraw, so a bare `set_size` would leave the grid diverged from
+    /// tmux - a duplicated prompt and a cursor stranded on the wrong row that no
+    /// later output reconciles (see `seed_parser`). Server-only.
+    #[cfg(feature = "serve")]
+    pub(crate) fn set_grid_size(&self, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        if (cols, rows)
+            != (
+                self.cols.load(Ordering::Relaxed),
+                self.rows.load(Ordering::Relaxed),
+            )
+        {
+            self.cols.store(cols, Ordering::Relaxed);
+            self.rows.store(rows, Ordering::Relaxed);
+            seed_parser(&self.target, &self.parser, &self.app_cursor, cols, rows);
         }
     }
 
@@ -678,6 +785,16 @@ impl VtChannel {
     /// of writing into a dead socket or sampling a frozen grid.
     pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// A receiver that fires whenever the grid changes (output arrived) or the
+    /// channel dies. Each connection holds its own, so every viewer of this
+    /// shared channel wakes on a change; `changed()` also returns immediately
+    /// if a bump happened since the last wait, so output between waits is never
+    /// missed. Lets a viewer render on output instead of polling. Server-only.
+    #[cfg(feature = "serve")]
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changed_tx.subscribe()
     }
 
     fn write_input(&self, bytes: &[u8]) -> bool {
@@ -740,6 +857,65 @@ mod tests {
             !content.contains("\x1b[10C") && !content.contains("\x1b[C"),
             "cursor-forward escape leaked:\n{content:?}"
         );
+    }
+
+    #[test]
+    fn lf_to_crlf_unstaircases_seed_rows() {
+        // capture-pane joins rows with bare LF; fed raw, the vt100 parser
+        // staircases each row off the previous one's end column. lf_to_crlf
+        // must make every row start at column 0 (regression: an idle/parked
+        // prompt whose seed never gets a live repaint rendered staircased,
+        // putting the cursor on the wrong row).
+        let raw = b"line-1\nline-2\nREADY> ";
+        let mut staircased = vt100::Parser::new(6, 40, 0);
+        staircased.process(raw);
+        assert_eq!(
+            staircased
+                .screen()
+                .cell(1, 0)
+                .map(|c| c.contents())
+                .as_deref(),
+            Some(""),
+            "control: bare LF should staircase (row 1 col 0 empty)"
+        );
+
+        let mut fixed = vt100::Parser::new(6, 40, 0);
+        fixed.process(&lf_to_crlf(raw));
+        assert_eq!(
+            fixed.screen().cell(0, 0).map(|c| c.contents()).as_deref(),
+            Some("l"),
+            "row 0 starts at col 0"
+        );
+        assert_eq!(
+            fixed.screen().cell(1, 0).map(|c| c.contents()).as_deref(),
+            Some("l"),
+            "row 1 must start at col 0, not staircase"
+        );
+        assert_eq!(
+            fixed.screen().cell(2, 0).map(|c| c.contents()).as_deref(),
+            Some("R"),
+            "prompt row starts at col 0"
+        );
+    }
+
+    #[test]
+    fn lf_to_crlf_leaves_existing_crlf_alone() {
+        assert_eq!(lf_to_crlf(b"a\r\nb"), b"a\r\nb");
+        assert_eq!(lf_to_crlf(b"a\nb"), b"a\r\nb");
+    }
+
+    #[test]
+    fn trim_trailing_blank_rows_strips_pane_padding() {
+        // capture-pane pads the body to the full pane height; without trimming,
+        // the seeded cursor would march down those empty rows and land far
+        // below the prompt (regression: cursor one row below the input box).
+        assert_eq!(
+            trim_trailing_blank_rows(b"line-1\nREADY> \n\n\n"),
+            b"line-1\nREADY>"
+        );
+        assert_eq!(trim_trailing_blank_rows(b"READY>"), b"READY>");
+        // Interior blanks are preserved; only the trailing run is trimmed.
+        assert_eq!(trim_trailing_blank_rows(b"a\n\nb\n  \n"), b"a\n\nb");
     }
 
     #[test]
