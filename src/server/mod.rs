@@ -1188,8 +1188,17 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
     // non-blocking so daemon startup never waits on git/network; freshly applied
-    // updates are picked up on the next daemon restart.
-    crate::plugin::auto_update::spawn_if_enabled(&crate::session::Config::load_or_warn());
+    // updates are picked up on the next daemon restart. The plugin host (when
+    // running) is passed as the notifier so a consent-needed skip surfaces as a
+    // dashboard notification, not just a log line.
+    let update_notifier = state
+        .plugin_host
+        .clone()
+        .map(|h| h as std::sync::Arc<dyn crate::plugin::auto_update::UpdateNotifier>);
+    crate::plugin::auto_update::spawn_if_enabled(
+        &crate::session::Config::load_or_warn(),
+        update_notifier,
+    );
 
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
     login_manager.spawn_cleanup_task(state.shutdown.clone());
@@ -1512,6 +1521,18 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins/details", get(api::plugin_details))
         .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
+        .route(
+            "/api/plugins/{id}/update/preview",
+            get(api::plugin_update_preview),
+        )
+        .route(
+            "/api/plugins/{id}/update/apply",
+            post(api::apply_plugin_update),
+        )
+        .route(
+            "/api/plugins/{id}/update/dismiss",
+            post(api::dismiss_plugin_update),
+        )
         .route(
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),
