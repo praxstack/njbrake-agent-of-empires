@@ -2982,6 +2982,34 @@ fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, reported: u3
     });
 }
 
+/// What to do with one instance's status_poll_loop diff, once a genuine
+/// `old != inst.status` transition (against the tick's `prev` snapshot) has
+/// already been established by the caller.
+struct PassiveTransitionDecision {
+    /// `None` for structured (ACP) sessions: their `status` isn't
+    /// poller-authoritative (see the `is_structured()` guard in
+    /// `update_status_with_metadata_inner`, and `apply_acp_overlay_inplace`,
+    /// which is the sole authority for their status/timestamps). Persisting
+    /// a patch here would write a bogus tmux-derived status to disk for a
+    /// session the poller never actually controls. Regression: #2697.
+    patch: Option<crate::session::PassiveStatusPatch>,
+    mark_unread: bool,
+}
+
+fn decide_passive_transition(
+    inst: &Instance,
+    old_status: Status,
+    unread_enabled: bool,
+) -> PassiveTransitionDecision {
+    let patch =
+        (!inst.is_structured()).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
+    let mark_unread = unread_enabled
+        && old_status == Status::Running
+        && inst.status == Status::Idle
+        && !inst.unread;
+    PassiveTransitionDecision { patch, mark_unread }
+}
+
 /// Background task that periodically refreshes session statuses. On each
 /// tick, diffs pre- and post-refresh statuses and emits a `StatusChange`
 /// on `state.status_tx` for every transition. Keeping the diff here,
@@ -3027,6 +3055,15 @@ async fn status_poll_loop(state: Arc<AppState>) {
         let suppressed_ids =
             crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
         let file_watch_for_poll = state.file_watch.clone();
+        // Seed each freshly-disk-loaded instance's live status baseline from
+        // `prev` (the true previous-tick live status) rather than letting
+        // `update_status_with_metadata` fall back to comparing against its
+        // own possibly-stale disk-loaded `status`. Without this, every tick
+        // that finds disk out of sync with live reality (the common case,
+        // since nothing persists a passive transition until the patch below
+        // lands) misreads that mismatch as a brand new transition and
+        // restamps idle_entered_at/last_accessed_at. See #2690.
+        let prev_for_poll = prev.clone();
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
             crate::tmux::refresh_session_cache();
@@ -3036,6 +3073,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     inst.status = Status::Starting;
                     continue;
                 }
+                inst.live_status_baseline = prev_for_poll.get(&inst.id).copied();
                 let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
                 let metadata = pane_metadata.get(&session_name);
                 inst.update_status_with_metadata(metadata);
@@ -3049,57 +3087,78 @@ async fn status_poll_loop(state: Arc<AppState>) {
             // post-suppression, post-tmux-scrape values, never the acp
             // overlay applied by the helper.
             let now = chrono::Utc::now();
-            for inst in &instances {
-                if let Some(old) = prev.get(&inst.id) {
-                    if *old != inst.status {
-                        let _ = state.status_tx.send(StatusChange {
-                            instance_id: inst.id.clone(),
-                            instance_title: inst.title.clone(),
-                            old: *old,
-                            new: inst.status,
-                            at: now,
-                        });
-                    }
-                }
-            }
-
+            let unread_enabled = crate::session::unread_enabled();
+            // Passive status transitions observed this tick, persisted
+            // promptly so the next reload (including the next tick, since
+            // this loop reloads from disk every cycle) finds disk already
+            // in sync with live reality instead of restamping again. See
+            // #2690. Batched per profile: one `Storage::update` per profile
+            // per tick, not one per transitioned session.
+            let mut patches_by_profile: std::collections::HashMap<
+                String,
+                Vec<crate::session::PassiveStatusPatch>,
+            > = std::collections::HashMap::new();
             // Auto-mark unread on a finished turn (Running -> Idle), the same
             // transition the TUI marks on. This is what lets a web-only user
             // (no TUI process polling) accrue the indicator. There's no
             // server-side "is being viewed" exemption: the client suppresses
             // the chip on the session it is actively viewing and clears the
-            // auto marker on open. Mutate the in-memory rows we're about to
-            // install AND persist per profile so the next disk reload keeps it.
-            if crate::session::unread_enabled() {
-                let mut newly_idle: std::collections::HashMap<String, Vec<String>> =
-                    std::collections::HashMap::new();
-                for inst in &mut instances {
-                    let finished_turn = prev.get(&inst.id) == Some(&Status::Running)
-                        && inst.status == Status::Idle
-                        && !inst.unread;
-                    if finished_turn {
-                        inst.mark_unread();
-                        newly_idle
-                            .entry(inst.source_profile.clone())
-                            .or_default()
-                            .push(inst.id.clone());
-                    }
+            // auto marker on open.
+            let mut newly_idle_by_profile: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for inst in &mut instances {
+                let Some(old) = prev.get(&inst.id) else {
+                    continue;
+                };
+                if *old == inst.status {
+                    continue;
                 }
-                for (profile, ids) in newly_idle {
-                    let _ = api::persist_session_update(
-                        profile,
-                        "auto-unread",
-                        state.file_watch.clone(),
-                        move |insts| {
-                            for inst in insts.iter_mut() {
-                                if ids.contains(&inst.id) {
-                                    inst.mark_unread();
-                                }
+                let _ = state.status_tx.send(StatusChange {
+                    instance_id: inst.id.clone(),
+                    instance_title: inst.title.clone(),
+                    old: *old,
+                    new: inst.status,
+                    at: now,
+                });
+                let decision = decide_passive_transition(inst, *old, unread_enabled);
+                if let Some(patch) = decision.patch {
+                    patches_by_profile
+                        .entry(inst.source_profile.clone())
+                        .or_default()
+                        .push(patch);
+                }
+                if decision.mark_unread {
+                    inst.mark_unread();
+                    newly_idle_by_profile
+                        .entry(inst.source_profile.clone())
+                        .or_default()
+                        .push(inst.id.clone());
+                }
+            }
+            let profiles: std::collections::HashSet<String> = patches_by_profile
+                .keys()
+                .chain(newly_idle_by_profile.keys())
+                .cloned()
+                .collect();
+            for profile in profiles {
+                let patches = patches_by_profile.remove(&profile).unwrap_or_default();
+                let unread_ids = newly_idle_by_profile.remove(&profile).unwrap_or_default();
+                let _ = api::persist_session_update(
+                    profile,
+                    "passive-status",
+                    state.file_watch.clone(),
+                    move |insts| {
+                        for inst in insts.iter_mut() {
+                            if let Some(patch) = patches.iter().find(|p| p.id == inst.id) {
+                                inst.merge_passive_status_patch(patch);
                             }
-                        },
-                    )
-                    .await;
-                }
+                            if unread_ids.contains(&inst.id) {
+                                inst.mark_unread();
+                            }
+                        }
+                    },
+                )
+                .await;
             }
 
             reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;
@@ -4355,6 +4414,79 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decide_passive_transition_skips_patch_for_structured_session() {
+        // #2697: a status_poll_loop CI regression. Structured/ACP sessions
+        // have no tmux pane for the poller to probe; their `status` is not
+        // poller-authoritative (the ACP overlay is), so a disk/detected
+        // mismatch must not be persisted as a passive status patch.
+        let mut inst = Instance::new("acp-session", "/tmp/test");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Idle;
+
+        let decision = decide_passive_transition(&inst, Status::Starting, false);
+
+        assert!(
+            decision.patch.is_none(),
+            "structured sessions must never get a passive status patch"
+        );
+    }
+
+    #[test]
+    fn decide_passive_transition_patches_plain_tmux_session() {
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.idle_entered_at = Some(chrono::Utc::now());
+        inst.last_accessed_at = Some(chrono::Utc::now());
+
+        let decision = decide_passive_transition(&inst, Status::Running, false);
+
+        let patch = decision.patch.expect("plain tmux session must get a patch");
+        assert_eq!(patch.id, inst.id);
+        assert_eq!(patch.status, Status::Idle);
+        assert_eq!(patch.idle_entered_at, inst.idle_entered_at);
+        assert_eq!(patch.last_accessed_at, inst.last_accessed_at);
+    }
+
+    #[test]
+    fn decide_passive_transition_never_fabricates_last_accessed_at() {
+        // A session that transitions status before any user touch has
+        // last_accessed_at == None on disk; the patch must preserve that,
+        // not fabricate a stamp, or a brand-new session gains a spurious
+        // "touched" signal that idle-reap and the freshness sort rely on
+        // being absent.
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.last_accessed_at = None;
+
+        let decision = decide_passive_transition(&inst, Status::Running, false);
+
+        let patch = decision.patch.expect("plain tmux session must get a patch");
+        assert_eq!(patch.last_accessed_at, None);
+    }
+
+    #[test]
+    fn decide_passive_transition_marks_unread_only_on_running_to_idle() {
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+
+        let decision = decide_passive_transition(&inst, Status::Running, true);
+        assert!(decision.mark_unread);
+
+        let decision = decide_passive_transition(&inst, Status::Waiting, true);
+        assert!(
+            !decision.mark_unread,
+            "only a Running -> Idle transition marks unread"
+        );
+
+        inst.unread = true;
+        let decision = decide_passive_transition(&inst, Status::Running, true);
+        assert!(
+            !decision.mark_unread,
+            "already-unread sessions must not re-mark"
+        );
+    }
 
     #[test]
     fn extract_web_build_id_finds_entry_bundle() {

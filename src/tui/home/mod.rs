@@ -2698,6 +2698,7 @@ impl HomeView {
             let new_status = update.status;
             let new_error = update.last_error;
             let new_idle_entered_at = update.idle_entered_at;
+            let new_live_status_baseline = update.live_status_baseline;
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
                 inst.last_error = new_error;
@@ -2708,16 +2709,19 @@ impl HomeView {
                 if new_last_accessed.is_some() {
                     inst.last_accessed_at = new_last_accessed;
                 }
+                // Conditional, not unconditional like idle_entered_at: a
+                // producer that never establishes a baseline (attached_
+                // status_hooks's snapshot, when its own instance clone
+                // hasn't polled yet) must not clear one this instance
+                // already has. See #2690 CodeRabbit follow-up.
+                if let Some(baseline) = new_live_status_baseline {
+                    inst.live_status_baseline = Some(baseline);
+                }
                 inst.pane_dead_observed = new_pane_dead;
             });
 
             if let Some(old) = old_status {
                 if old != new_status {
-                    if let Some(inst) = self.get_instance(&update.id).cloned() {
-                        self.handle_status_transition(
-                            &inst, old, new_status, play_sound, run_hooks,
-                        );
-                    }
                     // Auto-mark unread when a turn finishes (Running ->
                     // Idle), unless the user is currently viewing this
                     // session in live-send. This runs in both the with-
@@ -2726,22 +2730,34 @@ impl HomeView {
                     // elsewhere still gets marked. The attached session
                     // itself is cleared on attach-return, so a turn that
                     // finishes during an attach nets to read.
-                    if crate::session::unread_enabled()
+                    let is_live_target = self
+                        .live_send
+                        .as_ref()
+                        .is_some_and(|s| s.session_id == update.id);
+                    // Skip when already unread (the mark is a no-op) so a
+                    // re-finishing session doesn't churn the flock once
+                    // per turn.
+                    let already_unread =
+                        self.get_instance(&update.id).is_some_and(|i| i.is_unread());
+                    let should_mark_unread = crate::session::unread_enabled()
                         && old == Status::Running
                         && new_status == Status::Idle
-                    {
-                        let is_live_target = self
-                            .live_send
-                            .as_ref()
-                            .is_some_and(|s| s.session_id == update.id);
-                        // Skip the disk write when already unread (the mark
-                        // is a no-op) so a re-finishing session doesn't churn
-                        // the flock once per turn.
-                        let already_unread =
-                            self.get_instance(&update.id).is_some_and(|i| i.is_unread());
-                        if !is_live_target && !already_unread {
-                            let _ = self.apply_user_action(&update.id, |inst| inst.mark_unread());
-                        }
+                        && !is_live_target
+                        && !already_unread;
+
+                    // One flock for both the status/timestamp patch and the
+                    // unread mark, matching the daemon's per-tick batching
+                    // shape (server/mod.rs's status_poll_loop) instead of
+                    // two separate Storage::update calls on the same row.
+                    self.persist_passive_status_transition(&update.id, should_mark_unread);
+                    if should_mark_unread {
+                        self.mutate_instance(&update.id, |inst| inst.mark_unread());
+                    }
+
+                    if let Some(inst) = self.get_instance(&update.id).cloned() {
+                        self.handle_status_transition(
+                            &inst, old, new_status, play_sound, run_hooks,
+                        );
                     }
                 }
             }
@@ -5211,6 +5227,38 @@ impl HomeView {
             self.instance_map.insert(id.to_string(), inst.clone());
         }
         Ok(())
+    }
+
+    /// Persist a passively-detected status transition for one instance so
+    /// the next disk reload (a TUI relaunch, or a peer like `aoe serve`)
+    /// finds disk already caught up instead of comparing against a stale
+    /// snapshot and misreading it as a fresh transition. See #2690. Best
+    /// effort: unlike `apply_user_action`, a write failure here does not
+    /// roll back the in-memory status update, since the poller is the sole
+    /// authority on live status regardless of whether disk persistence
+    /// succeeds.
+    ///
+    /// `mark_unread` folds the Running -> Idle unread mark into the same
+    /// `Storage::update` call instead of a second flock round-trip on the
+    /// same row in the same tick, matching the daemon's per-tick batching
+    /// shape in `status_poll_loop`.
+    pub(super) fn persist_passive_status_transition(&self, id: &str, mark_unread: bool) {
+        let Some(inst) = self.instance_map.get(id) else {
+            return;
+        };
+        let Some(storage) = self.storages.get(&inst.source_profile) else {
+            return;
+        };
+        let patch = crate::session::PassiveStatusPatch::from_instance(inst);
+        let _ = storage.update(|insts, _groups| {
+            if let Some(disk) = insts.iter_mut().find(|i| i.id == patch.id) {
+                disk.merge_passive_status_patch(&patch);
+                if mark_unread {
+                    disk.mark_unread();
+                }
+            }
+            Ok(())
+        });
     }
 
     /// Atomic per-action mutate: in-memory once, disk via

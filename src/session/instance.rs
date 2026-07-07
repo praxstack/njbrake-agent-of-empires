@@ -691,6 +691,17 @@ pub struct Instance {
     pub last_error_check: Option<std::time::Instant>,
     #[serde(skip)]
     pub last_start_time: Option<std::time::Instant>,
+    /// Last status a caller has actually observed live (as opposed to
+    /// whatever `status` happens to hold after a fresh disk load). `None`
+    /// means no live observation has happened yet for this in-memory
+    /// object, so `update_status_with_metadata` must not treat a mismatch
+    /// against a possibly-stale disk-loaded `status` as a real transition.
+    /// See #2690: comparing against disk `status` directly caused every
+    /// restart (TUI relaunch, daemon reload) to misdetect "disk hasn't
+    /// caught up yet" as "just transitioned now", clobbering
+    /// `idle_entered_at`/`last_accessed_at`.
+    #[serde(skip)]
+    pub live_status_baseline: Option<Status>,
     #[serde(skip)]
     pub last_error: Option<String>,
     #[serde(skip)]
@@ -1005,6 +1016,42 @@ fn publish_session_to_tmux_env(tmux_session_name: &str, instance_id: &str, sessi
     }
 }
 
+/// A passively-detected status transition, queued for a batched disk write.
+/// Produced by the TUI's and daemon's background pollers when a genuine
+/// live status change is observed (see [`Instance::update_status_with_metadata`]
+/// and its `live_status_baseline` field), consumed by
+/// [`Instance::merge_passive_status_patch`]. `pub(crate)`: this is an
+/// internal wire format between the pollers and `merge_passive_status_patch`,
+/// not a stable type for out-of-tree consumers.
+#[derive(Debug, Clone)]
+pub(crate) struct PassiveStatusPatch {
+    pub id: String,
+    pub status: Status,
+    pub idle_entered_at: Option<DateTime<Utc>>,
+    /// `None` when the source `Instance` was never touched by a user
+    /// (`last_accessed_at` itself `None`); must stay `None` in that case
+    /// rather than fabricating a stamp, or a session that transitions
+    /// status before anyone ever attaches would gain a spurious
+    /// `last_accessed_at` and break the "`None` = never touched" contract
+    /// idle-reap and the freshness sort rely on.
+    pub last_accessed_at: Option<DateTime<Utc>>,
+}
+
+impl PassiveStatusPatch {
+    /// Build a patch from the current state of `inst`, as observed by a
+    /// background poller. Single construction site for both the TUI and
+    /// daemon pollers, so the `last_accessed_at` None-preservation policy
+    /// lives in one place.
+    pub(crate) fn from_instance(inst: &Instance) -> Self {
+        Self {
+            id: inst.id.clone(),
+            status: inst.status,
+            idle_entered_at: inst.idle_entered_at,
+            last_accessed_at: inst.last_accessed_at,
+        }
+    }
+}
+
 impl Instance {
     pub fn new(title: &str, project_path: &str) -> Self {
         Self {
@@ -1060,6 +1107,12 @@ impl Instance {
             fork_pending: None,
             last_error_check: None,
             last_start_time: None,
+            // A freshly constructed (not deserialized) Instance has a
+            // known-good live status right now: itself. Seeding the
+            // baseline here means the first real transition after
+            // creation restamps normally instead of being swallowed as
+            // a "no live history yet" seed.
+            live_status_baseline: Some(Status::Idle),
             last_error: None,
             session_id_poller: None,
             retroactive_capture_excludes: HashSet::new(),
@@ -1305,6 +1358,40 @@ impl Instance {
         self.status = src.status;
         self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
         self.idle_entered_at = src.idle_entered_at;
+    }
+
+    /// Apply a passively-detected status transition to a disk row. Touches
+    /// the same three fields as [`Self::merge_from_tui`] (`status`,
+    /// `idle_entered_at`, `last_accessed_at`); the real distinction is the
+    /// API shape (a minimal [`PassiveStatusPatch`] rather than a full
+    /// `Self`) and the merge policy on `last_accessed_at`: `merge_from_tui`
+    /// takes the monotone max, this drops the incoming `last_accessed_at`
+    /// outright when disk already has a strictly newer one, so a
+    /// poller-produced patch loses to a newer explicit user touch instead of
+    /// racing it.
+    ///
+    /// `status`/`idle_entered_at` always apply regardless: the poller is the
+    /// sole authority on detected agent status, and gating them on the
+    /// `last_accessed_at` comparison would let an unrelated peer touch
+    /// strand a real status transition on disk until the next one. See
+    /// #2690, #2697.
+    pub(crate) fn merge_passive_status_patch(&mut self, patch: &PassiveStatusPatch) {
+        self.status = patch.status;
+        self.idle_entered_at = patch.idle_entered_at;
+        let Some(incoming) = patch.last_accessed_at else {
+            return;
+        };
+        if self.last_accessed_at.is_some_and(|disk| disk > incoming) {
+            tracing::debug!(
+                target: "session.store",
+                session_id = %patch.id,
+                disk_ts = ?self.last_accessed_at,
+                patch_ts = ?patch.last_accessed_at,
+                "dropped stale passive status patch's last_accessed_at (status/idle_entered_at still applied)"
+            );
+            return;
+        }
+        self.last_accessed_at = Some(incoming);
     }
 
     /// Per-field-conditional splice: copy `post.X` onto `self.X` only when
@@ -4033,18 +4120,32 @@ impl Instance {
 
     /// Update status using pre-fetched pane metadata to avoid per-instance
     /// subprocess spawns. Falls back to subprocess calls if metadata is missing.
+    ///
+    /// Restamps `idle_entered_at`/`last_accessed_at` only when the detected
+    /// status differs from `live_status_baseline`, the last status this
+    /// in-memory object actually observed live, NOT `self.status` as loaded.
+    /// `self.status` can be a stale disk snapshot right after a fresh load
+    /// (TUI relaunch, or every tick of the daemon's `status_poll_loop`,
+    /// which reloads instances from disk every cycle); comparing against it
+    /// misreads "disk hasn't caught up yet" as "just transitioned now" and
+    /// clobbers the timestamps every time disk and live detection disagree.
+    /// `live_status_baseline == None` means no live observation exists yet,
+    /// so the first check seeds the baseline without restamping. See #2690.
     pub fn update_status_with_metadata(&mut self, metadata: Option<&tmux::PaneMetadata>) {
-        let prev_status = self.status;
+        let baseline = self.live_status_baseline;
         self.update_status_with_metadata_inner(metadata);
-        if self.status != prev_status {
-            let now = Utc::now();
-            self.last_accessed_at = Some(now);
-            self.idle_entered_at = if self.status == Status::Idle {
-                Some(now)
-            } else {
-                None
-            };
+        if let Some(prev_status) = baseline {
+            if self.status != prev_status {
+                let now = Utc::now();
+                self.last_accessed_at = Some(now);
+                self.idle_entered_at = if self.status == Status::Idle {
+                    Some(now)
+                } else {
+                    None
+                };
+            }
         }
+        self.live_status_baseline = Some(self.status);
     }
 
     fn update_status_with_metadata_inner(&mut self, metadata: Option<&tmux::PaneMetadata>) {
@@ -5477,6 +5578,204 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_passive_status_patch_applies_status_and_timestamps() {
+        let mut disk = Instance::new("session", "/tmp/test");
+        disk.status = Status::Running;
+        disk.idle_entered_at = None;
+        disk.last_accessed_at = Some(Utc::now() - chrono::Duration::hours(1));
+        disk.title = "peer-title".to_string();
+        disk.group_path = "peer/group".to_string();
+        disk.unread = true;
+        disk.archived_at = Some(Utc::now());
+        disk.favorited_at = None;
+        disk.pinned_at = Some(Utc::now());
+        let before = disk.clone();
+
+        let now = Utc::now();
+        let patch = PassiveStatusPatch {
+            id: disk.id.clone(),
+            status: Status::Idle,
+            idle_entered_at: Some(now),
+            last_accessed_at: Some(now),
+        };
+        disk.merge_passive_status_patch(&patch);
+
+        assert_eq!(disk.status, Status::Idle);
+        assert_eq!(disk.idle_entered_at, Some(now));
+        assert_eq!(disk.last_accessed_at, Some(now));
+        // Narrow splice: nothing else moves.
+        assert_eq!(disk.title, before.title);
+        assert_eq!(disk.group_path, before.group_path);
+        assert_eq!(disk.unread, before.unread);
+        assert_eq!(disk.archived_at, before.archived_at);
+        assert_eq!(disk.favorited_at, before.favorited_at);
+        assert_eq!(disk.pinned_at, before.pinned_at);
+    }
+
+    #[test]
+    fn test_merge_passive_status_patch_never_fabricates_last_accessed_at() {
+        // The source Instance was never touched by a user (last_accessed_at
+        // itself None); the patch must preserve that rather than fabricate
+        // a stamp, or a session that transitions status before anyone
+        // attaches gains a spurious "touched" signal.
+        let mut disk = Instance::new("session", "/tmp/test");
+        disk.status = Status::Starting;
+        disk.last_accessed_at = None;
+
+        let patch = PassiveStatusPatch {
+            id: disk.id.clone(),
+            status: Status::Idle,
+            idle_entered_at: Some(Utc::now()),
+            last_accessed_at: None,
+        };
+        disk.merge_passive_status_patch(&patch);
+
+        assert_eq!(disk.status, Status::Idle, "status must still apply");
+        assert_eq!(
+            disk.last_accessed_at, None,
+            "must not fabricate a last_accessed_at the source never had"
+        );
+    }
+
+    #[test]
+    fn test_merge_passive_status_patch_status_and_idle_entered_at_apply_even_when_last_accessed_at_is_stale(
+    ) {
+        // A peer (CLI, TUI apply_user_action) touched last_accessed_at more
+        // recently than the passive patch's snapshot: only last_accessed_at
+        // is guarded. status/idle_entered_at still apply, or a real status
+        // transition would silently strand on disk until the next one.
+        let mut disk = Instance::new("session", "/tmp/test");
+        let peer_touch = Utc::now();
+        disk.status = Status::Running;
+        disk.last_accessed_at = Some(peer_touch);
+        disk.idle_entered_at = None;
+
+        let stale_patch = PassiveStatusPatch {
+            id: disk.id.clone(),
+            status: Status::Idle,
+            idle_entered_at: Some(peer_touch - chrono::Duration::minutes(5)),
+            last_accessed_at: Some(peer_touch - chrono::Duration::minutes(5)),
+        };
+        disk.merge_passive_status_patch(&stale_patch);
+
+        assert_eq!(
+            disk.status,
+            Status::Idle,
+            "status must apply even when last_accessed_at is stale"
+        );
+        assert_eq!(
+            disk.idle_entered_at,
+            Some(peer_touch - chrono::Duration::minutes(5)),
+            "idle_entered_at must apply even when last_accessed_at is stale"
+        );
+        assert_eq!(
+            disk.last_accessed_at,
+            Some(peer_touch),
+            "only last_accessed_at itself is guarded against the stale patch"
+        );
+    }
+
+    #[test]
+    fn test_merge_passive_status_patch_last_accessed_at_boundary_equal_applies() {
+        let mut disk = Instance::new("session", "/tmp/test");
+        let ts = Utc::now();
+        disk.last_accessed_at = Some(ts);
+
+        let patch = PassiveStatusPatch {
+            id: disk.id.clone(),
+            status: Status::Idle,
+            idle_entered_at: None,
+            last_accessed_at: Some(ts),
+        };
+        disk.merge_passive_status_patch(&patch);
+
+        assert_eq!(
+            disk.last_accessed_at,
+            Some(ts),
+            "equal timestamps must apply (guard is strict >, not >=)"
+        );
+    }
+
+    #[test]
+    fn test_merge_passive_status_patch_last_accessed_at_boundary_newer_applies() {
+        let mut disk = Instance::new("session", "/tmp/test");
+        let older = Utc::now() - chrono::Duration::minutes(1);
+        disk.last_accessed_at = Some(older);
+
+        let newer = Utc::now();
+        let patch = PassiveStatusPatch {
+            id: disk.id.clone(),
+            status: Status::Idle,
+            idle_entered_at: None,
+            last_accessed_at: Some(newer),
+        };
+        disk.merge_passive_status_patch(&patch);
+
+        assert_eq!(disk.last_accessed_at, Some(newer));
+    }
+
+    #[test]
+    fn test_merge_passive_status_patch_last_accessed_at_boundary_disk_none_applies() {
+        // disk.last_accessed_at == None means never touched, not "newer":
+        // `is_some_and` short-circuits to false, so the patch always wins.
+        let mut disk = Instance::new("session", "/tmp/test");
+        disk.last_accessed_at = None;
+
+        let ts = Utc::now();
+        let patch = PassiveStatusPatch {
+            id: disk.id.clone(),
+            status: Status::Idle,
+            idle_entered_at: None,
+            last_accessed_at: Some(ts),
+        };
+        disk.merge_passive_status_patch(&patch);
+
+        assert_eq!(disk.last_accessed_at, Some(ts));
+    }
+
+    #[test]
+    fn test_merge_passive_status_patch_twice_identical_is_idempotent() {
+        let mut disk = Instance::new("session", "/tmp/test");
+        let ts = Utc::now();
+        let patch = PassiveStatusPatch {
+            id: disk.id.clone(),
+            status: Status::Idle,
+            idle_entered_at: Some(ts),
+            last_accessed_at: Some(ts),
+        };
+        disk.merge_passive_status_patch(&patch);
+        disk.merge_passive_status_patch(&patch);
+
+        assert_eq!(disk.status, Status::Idle);
+        assert_eq!(disk.idle_entered_at, Some(ts));
+        assert_eq!(disk.last_accessed_at, Some(ts));
+    }
+
+    #[test]
+    fn test_merge_passive_status_patch_twice_increasing_newer_wins() {
+        let mut disk = Instance::new("session", "/tmp/test");
+        let t0 = Utc::now() - chrono::Duration::minutes(1);
+        let t1 = Utc::now();
+
+        disk.merge_passive_status_patch(&PassiveStatusPatch {
+            id: disk.id.clone(),
+            status: Status::Running,
+            idle_entered_at: None,
+            last_accessed_at: Some(t0),
+        });
+        disk.merge_passive_status_patch(&PassiveStatusPatch {
+            id: disk.id.clone(),
+            status: Status::Idle,
+            idle_entered_at: Some(t1),
+            last_accessed_at: Some(t1),
+        });
+
+        assert_eq!(disk.status, Status::Idle);
+        assert_eq!(disk.idle_entered_at, Some(t1));
+        assert_eq!(disk.last_accessed_at, Some(t1));
+    }
+
+    #[test]
     fn test_merge_from_tui_copies_status_pipeline() {
         let mut stored = Instance::new("session", "/tmp/test");
         stored.status = Status::Idle;
@@ -5490,6 +5789,152 @@ mod tests {
 
         assert_eq!(stored.status, Status::Running);
         assert_eq!(stored.idle_entered_at, src.idle_entered_at);
+    }
+
+    #[test]
+    fn test_update_status_with_metadata_seeds_baseline_without_restamp() {
+        // #2690: a session loaded fresh from disk (e.g. TUI relaunch, or
+        // every tick of the daemon's status_poll_loop) has no live
+        // observation history yet: `live_status_baseline` is `None`. The
+        // very first status check must not treat a mismatch between the
+        // disk-loaded `status` and the freshly detected status as a real
+        // transition, or every reload would reset idle_entered_at/
+        // last_accessed_at to `now`. Red on the pre-fix tree (which compares
+        // against `self.status` directly and always restamps here, since no
+        // real tmux session exists for this instance).
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.live_status_baseline = None;
+        inst.status = Status::Starting;
+        let stale_idle_entered_at = Some(Utc::now() - chrono::Duration::hours(2));
+        let stale_last_accessed_at = Some(Utc::now() - chrono::Duration::hours(2));
+        inst.idle_entered_at = stale_idle_entered_at;
+        inst.last_accessed_at = stale_last_accessed_at;
+
+        inst.update_status_with_metadata(None);
+
+        // No real tmux session exists for this instance, so detection
+        // resolves to Error, differing from the stale disk `Starting`. That
+        // mismatch must NOT be treated as a genuine transition.
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(
+            inst.idle_entered_at, stale_idle_entered_at,
+            "first check after a fresh load must not clobber a stale-but-real idle_entered_at"
+        );
+        assert_eq!(
+            inst.last_accessed_at, stale_last_accessed_at,
+            "first check after a fresh load must not clobber a stale-but-real last_accessed_at"
+        );
+        assert_eq!(
+            inst.live_status_baseline,
+            Some(Status::Error),
+            "the first check must seed the baseline for subsequent comparisons"
+        );
+    }
+
+    #[test]
+    fn test_update_status_with_metadata_restamps_on_genuine_transition() {
+        // Once a live baseline is established, a real status change still
+        // restamps normally (no regression from the #2690 fix).
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.live_status_baseline = Some(Status::Idle);
+        inst.status = Status::Idle;
+        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::hours(2));
+        inst.last_accessed_at = Some(Utc::now() - chrono::Duration::hours(2));
+
+        let before = Utc::now();
+        inst.update_status_with_metadata(None);
+        let after = Utc::now();
+
+        // No real tmux session exists, so detection resolves to Error: a
+        // genuine transition away from the established Idle baseline.
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(inst.idle_entered_at, None);
+        let last_accessed = inst.last_accessed_at.expect("must be restamped");
+        assert!(last_accessed >= before && last_accessed <= after);
+        assert_eq!(inst.live_status_baseline, Some(Status::Error));
+    }
+
+    #[test]
+    fn test_update_status_with_metadata_twice_same_status_never_restamps() {
+        // Two consecutive calls that both detect the same status (no real
+        // tmux session, so detection is deterministically Error) must
+        // neither restamp: not the first (baseline already matches), and
+        // not the second either.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.live_status_baseline = Some(Status::Error);
+        inst.status = Status::Error;
+        let sentinel_idle = Some(Utc::now() - chrono::Duration::hours(3));
+        let sentinel_accessed = Some(Utc::now() - chrono::Duration::hours(3));
+        inst.idle_entered_at = sentinel_idle;
+        inst.last_accessed_at = sentinel_accessed;
+
+        inst.update_status_with_metadata(None);
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(
+            inst.idle_entered_at, sentinel_idle,
+            "first call must not restamp"
+        );
+        assert_eq!(
+            inst.last_accessed_at, sentinel_accessed,
+            "first call must not restamp"
+        );
+
+        inst.update_status_with_metadata(None);
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(
+            inst.idle_entered_at, sentinel_idle,
+            "second call must not restamp"
+        );
+        assert_eq!(
+            inst.last_accessed_at, sentinel_accessed,
+            "second call must not restamp"
+        );
+    }
+
+    #[test]
+    fn test_update_status_with_metadata_twice_different_statuses_both_restamp() {
+        // Two back-to-back genuine transitions must both restamp, and the
+        // baseline must update between calls so the second comparison is
+        // against the first call's result, not the original value.
+        //
+        // Archiving short-circuits update_status_with_metadata_inner before
+        // it touches `status` (see the `is_archived()` guard), which lets
+        // this test fully control the "detected" status for two
+        // independent calls without a real tmux session.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.archive();
+        inst.live_status_baseline = Some(Status::Idle);
+        inst.status = Status::Running;
+
+        let before1 = Utc::now();
+        inst.update_status_with_metadata(None);
+        let after1 = Utc::now();
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "archived guard preserves status"
+        );
+        assert_eq!(inst.idle_entered_at, None, "non-idle transition clears it");
+        let first_stamp = inst
+            .last_accessed_at
+            .expect("first transition must restamp");
+        assert!(first_stamp >= before1 && first_stamp <= after1);
+        assert_eq!(inst.live_status_baseline, Some(Status::Running));
+
+        inst.status = Status::Idle;
+        let before2 = Utc::now();
+        inst.update_status_with_metadata(None);
+        let after2 = Utc::now();
+        assert_eq!(inst.status, Status::Idle);
+        let second_idle = inst
+            .idle_entered_at
+            .expect("second transition must restamp");
+        assert!(second_idle >= before2 && second_idle <= after2);
+        assert!(
+            second_idle >= first_stamp,
+            "second restamp must not be older than the first"
+        );
+        assert_eq!(inst.live_status_baseline, Some(Status::Idle));
     }
 
     #[test]
